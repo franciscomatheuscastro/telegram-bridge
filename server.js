@@ -188,13 +188,14 @@ function registerMessageListener() {
     try {
       const message = event.message;
       
+      const text = message.message || message.text;
       // Ignorar mensagens sem texto
-      if (!message || !message.text) {
-        return;
-      }
+      if (!message || !text) return;
       
       const chatId = normalizeChatId(message);
-      const text = message.text;
+
+      if (!chatId) return;
+
       const date = normalizeDate(message.date);
       const senderId = getSenderId(message);
       
