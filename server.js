@@ -3,14 +3,16 @@
  *
  * Este servidor conecta ao Telegram como usuário (MTProto),
  * escuta mensagens e as envia para um webhook do n8n.
- * Também expõe endpoints HTTP para enviar mensagens de volta e listar membros de grupos.
+ * Também expõe endpoints HTTP para enviar mensagens de volta, listar membros de grupos
+ * e adicionar usuários em grupos/supergrupos.
  *
- * @version 1.1.0
+ * @version 1.2.0
  */
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
+const { Api } = require("telegram"); // ✅ necessário para InviteToChannel
 const express = require("express");
 const axios = require("axios");
 const input = require("input");
@@ -48,7 +50,7 @@ function validateConfig() {
 
 /**
  * Normaliza o chatId baseado no tipo de chat:
- * - Canal: -100<channelId>
+ * - Canal/Supergrupo: -100<channelId>
  * - Grupo: -<chatId>
  * - Usuário: <userId>
  */
@@ -143,6 +145,32 @@ async function listAllParticipants(entity, max = 5000) {
   return participants;
 }
 
+/**
+ * ✅ Adiciona (convida) um usuário a um grupo/supergrupo/canal via MTProto.
+ * - groupRef: "@grupo", "-100123...", "t.me/...."
+ * - userRef: "@username" (recomendado) ou id/entidade resolvível pelo client.getEntity
+ */
+async function addUserToGroup(groupRef, userRef) {
+  if (!isConnected || !client) {
+    throw new Error("Cliente Telegram não conectado");
+  }
+
+  const groupEntity = await resolveChatEntity(groupRef);
+
+  // Aceita "@username", "username", id numérico etc. (dependendo do que a conta consegue resolver)
+  const userClean = String(userRef).trim().replace(/^@/, "");
+  const userEntity = await client.getEntity(userClean);
+
+  await client.invoke(
+    new Api.channels.InviteToChannel({
+      channel: groupEntity,
+      users: [userEntity],
+    })
+  );
+
+  return { group: groupRef, user: userRef, status: "invited" };
+}
+
 // ============================================
 // 📱 CLIENTE TELEGRAM
 // ============================================
@@ -208,6 +236,39 @@ app.post("/send-message", authMiddleware, async (req, res) => {
 });
 
 /**
+ * ✅ POST /add-to-group
+ * Adiciona/convida um usuário a um grupo/supergrupo/canal
+ *
+ * body:
+ * {
+ *   "group": "@grupo_ou_link_ou_-100id",
+ *   "user": "@username_ou_id"
+ * }
+ */
+app.post("/add-to-group", authMiddleware, async (req, res) => {
+  try {
+    const { group, user } = req.body;
+
+    if (!group || !user) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos 'group' e 'user' são obrigatórios",
+      });
+    }
+
+    const result = await addUserToGroup(group, user);
+
+    return res.json({
+      ok: true,
+      result,
+    });
+  } catch (error) {
+    console.error("❌ Erro ao adicionar usuário:", error.message);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/**
  * GET /group-members?chat=@grupo&limit=2000
  * Retorna lista de membros (quando permitido pelo Telegram).
  */
@@ -217,10 +278,14 @@ app.get("/group-members", authMiddleware, async (req, res) => {
     const limit = parseInt(req.query.limit || "5000", 10);
 
     if (!chat) {
-      return res.status(400).json({ ok: false, error: "Query param 'chat' é obrigatório" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Query param 'chat' é obrigatório" });
     }
     if (!isConnected || !client) {
-      return res.status(503).json({ ok: false, error: "Cliente Telegram não conectado" });
+      return res
+        .status(503)
+        .json({ ok: false, error: "Cliente Telegram não conectado" });
     }
 
     const entity = await resolveChatEntity(chat);
@@ -264,11 +329,12 @@ app.get("/health", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     name: "Telegram MTProto Bridge",
-    version: "1.1.0",
+    version: "1.2.0",
     status: isConnected ? "connected" : "disconnected",
     endpoints: {
       health: "GET /health",
       sendMessage: "POST /send-message",
+      addToGroup: "POST /add-to-group",
       groupMembers: "GET /group-members?chat=@grupo&limit=2000",
     },
   });
@@ -293,7 +359,12 @@ function registerMessageListener() {
         const date = normalizeDate(message.date);
         const senderId = getSenderId(message);
 
-        console.log(`📨 Mensagem recebida: chatId=${chatId}, texto="${text.substring(0, 50)}..."`);
+        console.log(
+          `📨 Mensagem recebida: chatId=${chatId}, texto="${text.substring(
+            0,
+            50
+          )}..."`
+        );
 
         await sendToN8n({
           source: "telegram-client",
@@ -367,7 +438,9 @@ async function main() {
   console.log("📋 Configuração:");
   console.log(`   - API ID: ${CONFIG.apiId}`);
   console.log(`   - API Hash: ${CONFIG.apiHash.substring(0, 6)}...`);
-  console.log(`   - Session: ${CONFIG.stringSession ? "✅ Configurada" : "❌ Vazia (login necessário)"}`);
+  console.log(
+    `   - Session: ${CONFIG.stringSession ? "✅ Configurada" : "❌ Vazia (login necessário)"}`
+  );
   console.log(`   - Webhook n8n: ${CONFIG.n8nWebhookUrl}`);
   console.log(`   - Porta HTTP: ${CONFIG.port}`);
   console.log(`   - Token: ${CONFIG.bridgeToken ? "✅ Configurado" : "❌ Desabilitado"}`);
@@ -378,15 +451,20 @@ async function main() {
 
     server = app.listen(CONFIG.port, () => {
       console.log(`\n🌐 Servidor HTTP rodando em http://localhost:${CONFIG.port}`);
-      console.log(`   - Health: GET http://localhost:${CONFIG.port}/health`);
+      console.log(`   - Health: GET  http://localhost:${CONFIG.port}/health`);
       console.log(`   - Enviar: POST http://localhost:${CONFIG.port}/send-message`);
-      console.log(`   - Membros: GET http://localhost:${CONFIG.port}/group-members?chat=@grupo&limit=2000`);
+      console.log(`   - Add:    POST http://localhost:${CONFIG.port}/add-to-group`);
+      console.log(
+        `   - Membros: GET  http://localhost:${CONFIG.port}/group-members?chat=@grupo&limit=2000`
+      );
       console.log("\n✅ Bridge pronto para uso!\n");
     });
 
     server.on("error", (err) => {
       if (err.code === "EADDRINUSE") {
-        console.error(`❌ Porta ${CONFIG.port} já está em uso. Troque a PORT ou mate o processo.`);
+        console.error(
+          `❌ Porta ${CONFIG.port} já está em uso. Troque a PORT ou mate o processo.`
+        );
       } else {
         console.error("❌ Erro no servidor HTTP:", err.message);
       }
